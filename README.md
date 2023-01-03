@@ -1,1 +1,4 @@
-# esp32_s2_dmx
+# Build
+
+Build against IDF v4.4.1
+
