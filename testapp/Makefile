@@ -1,4 +1,4 @@
-all : hidapi_test
+all : dmx512testapp
 
 UNAME := $(shell uname)
 
@@ -10,9 +10,9 @@ CFLAGS:=-g -O0
 LDFLAGS:=C:/windows/system32/setupapi.dll
 endif
 
-hidapi_test : hidapi_test.c
+dmx512testapp : dmx512testapp.c
 	gcc $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean :
-	rm -rf *.o *~ hidapi_test
+	rm -rf *.o *~ dmx512testapp
 
