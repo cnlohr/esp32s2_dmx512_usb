@@ -26,7 +26,9 @@
 
 #define MAX_DMX 1024
 uint8_t dmx_buffer[1024 + 4] = { 0 };
+uint8_t send_buffer[1024];
 volatile int highest_send = 0;
+volatile int do_send;
 
 SemaphoreHandle_t DoneSendMutex;
 SemaphoreHandle_t PleaseSendMutex;
@@ -74,6 +76,9 @@ void tud_hid_set_report_cb(uint8_t itf,
 		{
 			// Actually send.
 			xSemaphoreTake( DoneSendMutex, portMAX_DELAY );
+			do_send = highest_send;
+			memcpy( send_buffer, dmx_buffer, highest_send );
+			highest_send = 0;
 			xSemaphoreGive( PleaseSendMutex );
 		}
 	}
@@ -130,8 +135,8 @@ void app_main(void)
 		uart_wait_tx_done(DMX_UART, portMAX_DELAY);
 		ets_delay_us( 140 );
 		// I have literally no idea why this needs to be called from the main task instead of the USB task.
-		uart_write_bytes_with_break(DMX_UART, dmx_buffer+3, highest_send+1, 20 );
-		highest_send = 0;
+		uart_write_bytes_with_break(DMX_UART, send_buffer+3, do_send+1, 20 );
+		do_send = 0;
 	}
 	return;
 }

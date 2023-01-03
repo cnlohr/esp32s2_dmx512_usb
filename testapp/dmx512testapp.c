@@ -27,7 +27,7 @@ int main( int argc, char ** argv )
 	if( !hd ) { fprintf( stderr, "Could not open USB\n" ); return -94; }
 	// Disable mode.
 	uint8_t colodata[800] = { 0 };
-	int channels = 80;
+	int channels = 500;
 	int frame = 0;
 	do
 	{
