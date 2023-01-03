@@ -28,29 +28,68 @@
 #include "soc/rtc_cntl_reg.h"
 #include "soc/rtc.h"
 #include "regi2c_ctrl.h"
+#include "soc/uart_reg.h"
 #include "driver/periph_ctrl.h"
+#include "hal/uart_ll.h"
 
 #define DMX_UART UART_NUM_1
-
-// On the ESP32S2 (TRM, Page 288)
-#define ETS_I2S0_INUM 35
+#define UART_EMPTY_THRESH_DEFAULT 1
+#define UART_TX_BUFFER_SIZE 128
 
 #define BUFF_SIZE_BYTES 2048
 
-
 #define MAX_DMX 1024
 
-uint32_t * i2sbuffer[4] __attribute__((aligned(128)));
-uint8_t dmx_buffer[1024 + 4] = { 0 };
+uint8_t dmx_buffer[1024] = { 0 };
+uint8_t transmit_buffer[1024] = { 0 };
+volatile int dmx_buffer_snow = 0;
 volatile int highest_send = 0;
-static intr_handle_t i2s_intr_handle;
+volatile int transmit_total = 0;
+volatile int done_send = 1;
+static intr_handle_t uart_intr_handle;
 
 
 int isr_countOut;
-int i2s_running;
 
-static void IRAM_ATTR i2s_isr_fast(void* arg) {
-	REG_WRITE(I2S_INT_CLR_REG(0), (REG_READ(I2S_INT_RAW_REG(0)) & 0xffffffc0) | 0x3f);
+static void IRAM_ATTR uart_isr_fast(void* arg) {
+
+    int uart_intr_status = REG_READ( UART_INT_ST_REG( DMX_UART) ) ;
+    //Exit form while loop
+    if (uart_intr_status == 0)
+	{
+		return;
+	}
+	if( uart_intr_status & UART_TX_BRK_DONE_INT_RAW )
+	{
+		done_send = 1;
+		SET_PERI_REG_MASK(UART_CONF0_REG(DMX_UART), UART_TXD_BRK );
+		WRITE_PERI_REG( UART_INT_CLR_REG(DMX_UART), UART_TX_BRK_DONE_INT_RAW );
+	}
+	if( uart_intr_status & UART_INTR_TXFIFO_EMPTY )
+	{
+		int local_highest = transmit_total;
+		int local_snow = dmx_buffer_snow;
+		int i;
+		for( i = 0; i < UART_TX_BUFFER_SIZE-UART_EMPTY_THRESH_DEFAULT; i++ )
+		{
+			if( local_snow < local_highest )
+			{
+			    WRITE_PERI_REG( UART_FIFO_AHB_REG(DMX_UART), transmit_buffer[local_snow] );
+				local_snow++;
+			}
+			else
+			{
+				// No data left.
+			    CLEAR_PERI_REG_MASK( UART_INT_ENA_REG(DMX_UART), UART_INTR_TXFIFO_EMPTY );
+			    SET_PERI_REG_MASK( UART_INT_ENA_REG(DMX_UART), UART_TX_BRK_DONE_INT_RAW );
+				SET_PERI_REG_MASK(UART_CONF0_REG(DMX_UART), UART_TXD_BRK );
+				WRITE_PERI_REG( UART_IDLE_CONF_REG(DMX_UART), 40<<UART_TX_BRK_NUM_S );
+			}
+		}
+		dmx_buffer_snow = local_snow;
+		WRITE_PERI_REG( UART_INT_CLR_REG(DMX_UART),UART_INTR_TXFIFO_EMPTY );
+	}
+
 	++isr_countOut;
 }
 
@@ -88,7 +127,7 @@ void tud_hid_set_report_cb(uint8_t itf,
 		int towrite = buffer[3];
 		if( offset + towrite > sizeof( dmx_buffer ) )
 			towrite = sizeof( dmx_buffer ) - offset;
-		memcpy( dmx_buffer + offset + 4, buffer + 4, towrite );
+		memcpy( dmx_buffer + offset, buffer + 4, towrite );
 
 		if( offset + towrite > highest_send ) highest_send = offset + towrite;
 
@@ -96,8 +135,14 @@ void tud_hid_set_report_cb(uint8_t itf,
 
 		if( offset == 0 )
 		{
-			// Actually send.
-			// XXX TODO
+			while( !done_send ) taskYIELD();
+			memcpy( transmit_buffer, dmx_buffer, highest_send );			
+			dmx_buffer_snow = 0;
+			done_send = 0;
+			transmit_total = highest_send;
+			ets_delay_us(15);
+		    WRITE_PERI_REG( UART_FIFO_AHB_REG(DMX_UART), 0x00 ); // Mark byte
+		    SET_PERI_REG_MASK( UART_INT_ENA_REG(DMX_UART), UART_INTR_TXFIFO_EMPTY );	
 		}
 	}
 	else
@@ -107,176 +152,41 @@ void tud_hid_set_report_cb(uint8_t itf,
 }
 
 
-
-static lldesc_t s_dma_desc[4];
-
-
-static esp_err_t dma_desc_init()
-{
-	for (int i = 0; i < 4; ++i) {
-		i2sbuffer[i] = malloc( BUFF_SIZE_BYTES );
-		int j;
-		uint32_t * buff = i2sbuffer[i];
-
-		// Data is scanned out MSB first.
-		// But serial is LSB first.
-		for( j = 0; j < BUFF_SIZE_BYTES/4; j+=2 )
-		{
-			buff[j] = 0b11110000001111000000001111000000;
-			buff[j+1] = (0xaa<<3) | (0xaa<<13) | (0x55<<23) | (0b10000000011000000001100000000111);
-		}
-		s_dma_desc[i].length = BUFF_SIZE_BYTES;	 // size of a single DMA buf
-		s_dma_desc[i].size = BUFF_SIZE_BYTES;	   // total size of the chain
-		s_dma_desc[i].owner = 1;
-		s_dma_desc[i].sosf = 1;
-		s_dma_desc[i].buf = (uint8_t*) i2sbuffer[i];
-		s_dma_desc[i].offset = i;
-		s_dma_desc[i].empty = 0;
-		s_dma_desc[i].eof = 1;
-		s_dma_desc[i].qe.stqe_next = &s_dma_desc[(i+1)&1];
-
-		//memset( i2sbuffer[i], 0xf0, BUFF_SIZE_BYTES );
-	}
-	return ESP_OK;
-}
-
-
-
-void local_rtc_clk_apll_enable(bool enable, uint32_t sdm0, uint32_t sdm1, uint32_t sdm2, uint32_t o_div)
-{
-	REG_SET_FIELD(RTC_CNTL_ANA_CONF_REG, RTC_CNTL_PLLA_FORCE_PD, enable ? 0 : 1);
-	REG_SET_FIELD(RTC_CNTL_ANA_CONF_REG, RTC_CNTL_PLLA_FORCE_PU, enable ? 1 : 0);
-
-	if (enable) {
-		REGI2C_WRITE_MASK(I2C_APLL, I2C_APLL_DSDM2, sdm2);
-		REGI2C_WRITE_MASK(I2C_APLL, I2C_APLL_DSDM0, sdm0);
-		REGI2C_WRITE_MASK(I2C_APLL, I2C_APLL_DSDM1, sdm1);
-		REGI2C_WRITE(I2C_APLL, I2C_APLL_SDM_STOP, APLL_SDM_STOP_VAL_1);
-		REGI2C_WRITE(I2C_APLL, I2C_APLL_SDM_STOP, APLL_SDM_STOP_VAL_2_REV1);
-		REGI2C_WRITE_MASK(I2C_APLL, I2C_APLL_OR_OUTPUT_DIV, o_div);
-	}
-}
-
-
-
-static void i2s_fill_buf_fast() {
-
-	ESP_INTR_DISABLE(ETS_I2S0_INUM);
-	SET_PERI_REG_BITS(I2S_OUT_LINK_REG(0), I2S_OUTLINK_ADDR_V, ((uint32_t) &s_dma_desc), I2S_OUTLINK_ADDR_S);
-	SET_PERI_REG_BITS(I2S_OUT_LINK_REG(0), I2S_OUTLINK_START_V, 1, I2S_OUTLINK_START_S);
-
-	REG_WRITE(I2S_INT_CLR_REG(0), (REG_READ(I2S_INT_RAW_REG(0)) & 0xffffffc0) | 0x3f);
-
-	SET_PERI_REG_BITS(I2S_FIFO_CONF_REG(0), I2S_DSCR_EN_V, 1, I2S_DSCR_EN_S);
-
-	SET_PERI_REG_BITS(I2S_LC_CONF_REG(0), I2S_OUT_DATA_BURST_EN_V, 1, I2S_OUT_DATA_BURST_EN_S);
-	SET_PERI_REG_BITS(I2S_LC_CONF_REG(0), I2S_CHECK_OWNER_V, 1, I2S_CHECK_OWNER_S);
-	SET_PERI_REG_BITS(I2S_LC_CONF_REG(0), I2S_OUT_EOF_MODE_V, 1, I2S_OUT_EOF_MODE_S);
-	SET_PERI_REG_BITS(I2S_LC_CONF_REG(0), I2S_OUTDSCR_BURST_EN_V, 1, I2S_OUTDSCR_BURST_EN_S);
-	SET_PERI_REG_BITS(I2S_LC_CONF_REG(0), I2S_OUT_DATA_BURST_EN_V, 1, I2S_OUT_DATA_BURST_EN_S);
-
-
-	REG_WRITE(I2S_CONF_REG(0), REG_READ(I2S_CONF_REG(0)) & 0xfffffff0);
-	(void) REG_READ(I2S_CONF_REG(0));
-	REG_WRITE(I2S_CONF_REG(0), (REG_READ(I2S_CONF_REG(0)) & 0xfffffff0) | 0xf);
-	(void) REG_READ(I2S_CONF_REG(0));
-	REG_WRITE(I2S_CONF_REG(0), REG_READ(I2S_CONF_REG(0)) & 0xfffffff0);
-  //  while (GET_PERI_REG_BITS2(I2S_STATE_REG(0), 0x1, I2S_TX_FIFO_RESET_BACK_S));
-
-	ets_delay_us(10);
-
-	SET_PERI_REG_BITS(I2S_INT_ENA_REG(0), I2S_OUT_DONE_INT_ENA_V, 1, I2S_OUT_DONE_INT_ENA_S);
-	ESP_INTR_ENABLE(ETS_I2S0_INUM);
-	SET_PERI_REG_BITS(I2S_CONF_REG(0), I2S_TX_START_V, 1,I2S_TX_START_S);
-
-}
-
 void app_main(void)
 {
 	printf( "Starting\n" );
 	fflush(stdout);
 
-
-
-//	intr_matrix_set(0, ETS_I2S0_INTR_SOURCE, ETS_I2S0_INUM);
-
-	dma_desc_init();
-
-	gpio_num_t pins[] = {
-		GPIO_NUM_17,
-		GPIO_NUM_18,
+	uart_config_t uart_config = {
+		.baud_rate = 250000,
+		.data_bits = UART_DATA_8_BITS,
+		.parity = UART_PARITY_DISABLE,
+		.stop_bits = UART_STOP_BITS_1,
+		.flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
 	};
 
-	gpio_config_t conf = {
-		.mode = GPIO_MODE_INPUT,
-		.pull_up_en = GPIO_PULLUP_DISABLE,
-		.pull_down_en = GPIO_PULLDOWN_DISABLE,
-		.intr_type = GPIO_INTR_DISABLE
-	};
-	for (int i = 0; i < sizeof(pins)/sizeof(gpio_num_t); ++i) {
-		conf.pin_bit_mask = 1LL << pins[i];
-		gpio_config(&conf);
-	}
+	ESP_ERROR_CHECK(uart_param_config(DMX_UART, &uart_config));
+	ESP_ERROR_CHECK(uart_set_pin(DMX_UART, 18, -1, -1, -1));
 
 	// Use the IO matrix to create the inverse of TX on pin 17.
-	gpio_matrix_out( GPIO_NUM_17, I2S0O_WS_OUT_IDX, 0, 0 );
-	gpio_matrix_out( GPIO_NUM_18, I2S0O_DATA_OUT23_IDX, 0, 0 );
-
-
-	periph_module_enable(PERIPH_I2S0_MODULE);
-
-	WRITE_PERI_REG( I2S_LC_CONF_REG(0), 1<<I2S_IN_RST_S | 1<<I2S_AHBM_RST_S | 1<<I2S_AHBM_FIFO_RST_S );
-	WRITE_PERI_REG( I2S_LC_CONF_REG(0), 0);
-	SET_PERI_REG_BITS(I2S_CONF_REG(0), 0x1, 1, I2S_TX_RESET_S);
-	SET_PERI_REG_BITS(I2S_CONF_REG(0), 0x1, 0, I2S_TX_RESET_S);
-	SET_PERI_REG_BITS(I2S_CONF_REG(0), 0x1, 1, I2S_TX_FIFO_RESET_S);
-	SET_PERI_REG_BITS(I2S_CONF_REG(0), 0x1, 0, I2S_TX_FIFO_RESET_S);
-
-	SET_PERI_REG_BITS(I2S_CONF_REG(0), 0x1, 0, I2S_TX_SLAVE_MOD_S);  //Needed, otherwise it waits for a clock.
-
-//	WRITE_PERI_REG(I2S_CONF2_REG(0), | (0<<I2S_PRE_REQ_EN_S) | (0<<I2S_TX_DMA_EQUAL_S) );
-
-	// Configures APLL = 480 / 4 = 120
-	// 40 * (SDM2 + SDM1/(2^8) + SDM0/(2^16) + 4) / ( 2 * (ODIV+2) );
-	// Datasheet recommends that numerator does not exceed 500MHz.
-	//local_rtc_clk_apll_enable( 1, 0, 0, 8, 0 );
-
-	// According to TRM I2S_TX_BCK_DIV_NUM must not be set to 1.  But that's the only way to get this I2S to do anything fun.
-	// In case you want to go fast, be sure to set it to 1!  Then you can output at up to 80MHz with the 160M clock.
-	WRITE_PERI_REG(I2S_SAMPLE_RATE_CONF_REG(0), (32<<I2S_TX_BITS_MOD_S ) | ( 4<<I2S_TX_BCK_DIV_NUM_S) );  
-
-	// fI2S = fCLK / ( N + B/A )
-	// For 250kBAUD, N=160 if selecting 160M clock.
-	// DIV_NUM = N
-	// Note I2S_CLKM_DIV_NUM minimum = 2.
-	WRITE_PERI_REG( I2S_CLKM_CONF_REG(0), (2<<I2S_CLK_SEL_S) | (1<<I2S_CLK_EN_S) | (1<<I2S_CLKM_DIV_A_S) | (0<<I2S_CLKM_DIV_B_S) | (160<<I2S_CLKM_DIV_NUM_S) );  // Minimum reduction, 2:1
-	WRITE_PERI_REG( I2S_FIFO_CONF_REG(0), (32<<I2S_TX_DATA_NUM_S) ); // FIFO Size for low-waterm-mark
-	WRITE_PERI_REG( I2S_CONF_CHAN_REG(0), (0<<I2S_TX_CHAN_MOD_S));
-
-	WRITE_PERI_REG( I2S_CONF_SIGLE_DATA_REG(0), 0xffffffff );
-
-	SET_PERI_REG_BITS(I2S_CONF1_REG(0), I2S_TX_STOP_EN_V, 1, I2S_TX_STOP_EN_S);
-
-	WRITE_PERI_REG(I2S_CONF_REG(0), (1<<I2S_TX_RIGHT_FIRST_S) | (1<<I2S_TX_BIG_ENDIAN_S) );
-
-	WRITE_PERI_REG( I2S_TIMING_REG(0), 0 );
+	gpio_matrix_out( GPIO_NUM_17, U1TXD_OUT_IDX, 1, 0 );
 
 	// Start returning data to the application
-	esp_intr_alloc(ETS_I2S0_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM, i2s_isr_fast, (void*)REG_I2S_BASE(0), &i2s_intr_handle);
-	esp_intr_enable(i2s_intr_handle);
+	esp_intr_alloc(ETS_UART1_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM, uart_isr_fast, (void*)REG_UART_BASE(1), &uart_intr_handle);
+	esp_intr_enable(uart_intr_handle);
 
 	// Maximize the drive strength.
 	gpio_set_drive_capability( GPIO_NUM_17, GPIO_DRIVE_CAP_3 );
 	gpio_set_drive_capability( GPIO_NUM_18, GPIO_DRIVE_CAP_3 );
 
-	isr_countOut = 0;
-	i2s_running = true;
-	i2s_fill_buf_fast(0);
 
 	/* Initialize USB peripheral */
 	tinyusb_config_t tusb_cfg = {};
 	tinyusb_driver_install(&tusb_cfg);
 
+	uart_enable_tx_intr( DMX_UART, 1, UART_EMPTY_THRESH_DEFAULT);
+
+	printf( "%08x\n", REG_READ( UART_MEM_TX_STATUS_REG(1) ) );
 //	vTaskSuspend( 0 );
 
 //	uart_write_bytes_with_break(DMX_UART, "", 1, 20 ); // Can't use uart_write_bytes_with_break because break needs to go right before frame.

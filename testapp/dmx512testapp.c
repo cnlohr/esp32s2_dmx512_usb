@@ -27,7 +27,7 @@ int main( int argc, char ** argv )
 	if( !hd ) { fprintf( stderr, "Could not open USB\n" ); return -94; }
 	// Disable mode.
 	uint8_t colodata[800] = { 0 };
-	int channels = 80;
+	int channels = 250;
 	int frame = 0;
 	do
 	{
@@ -36,9 +36,9 @@ int main( int argc, char ** argv )
 		for( i = 0; i < 512/3+1; i++ )
 		{
 			int color = EHSVtoHEX( i + frame, 0xff, 0xff );
-			colodata[i*3+0] = 0x10;//color & 0xff;
-			colodata[i*3+1] = 0x10;//(color>>8) & 0xff;
-			colodata[i*3+2] = 0x10;//(color>>16) & 0xff;
+			colodata[i*3+0] = color & 0xff;
+			colodata[i*3+1] = (color>>8) & 0xff;
+			colodata[i*3+2] = (color>>16) & 0xff;
 		}
 	
 
