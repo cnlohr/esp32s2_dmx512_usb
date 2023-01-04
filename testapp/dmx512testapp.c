@@ -27,37 +27,43 @@ int main( int argc, char ** argv )
 	if( !hd ) { fprintf( stderr, "Could not open USB\n" ); return -94; }
 	// Disable mode.
 	uint8_t colodata[800] = { 0 };
-	int channels = 250;
+	int channels = 512;
 	int frame = 0;
 	do
 	{
 		frame++;
 		int i;
+		int idlight = frame%(512/3);
 		for( i = 0; i < 512/3+1; i++ )
 		{
-			int color = EHSVtoHEX( i + frame, 0xff, 0xff );
+/*
+			int color = EHSVtoHEX( i*10 + frame, 0xff, 0xff );
 			colodata[i*3+0] = color & 0xff;
 			colodata[i*3+1] = (color>>8) & 0xff;
 			colodata[i*3+2] = (color>>16) & 0xff;
+*/
+			colodata[i*3+0] = 
+			colodata[i*3+1] = 
+			colodata[i*3+2] = (idlight==i)?200:0;
 		}
 	
 
 		int chunk;
-		int chunks = (channels + 249) / 250;
+		int chunks = (channels + 247) / 248;
 		for( chunk = chunks-1; chunk >= 0; chunk-- )
 		{
 			// Upon sending 0th chunk, it will transmit the acutal signal.
 			uint8_t rdata[256] = { 0 };
 
-			int offset = chunk * 250;
+			int offset = chunk * 248;
 			int remain = channels - offset;
-			if( remain > 250 ) remain = 250;
+			if( remain > 248 ) remain = 248;
 
 			rdata[0] = 0xad;  // Feature Report ID
 			rdata[1] = 0x73;
 			rdata[2] = offset/4;
 			rdata[3] = remain;
-			memcpy( rdata+4, colodata + chunk * 250, 250 );
+			memcpy( rdata+4, colodata + chunk * 248, remain );
 			//printf( "%d %d rdata[10] = %02x\n", offset, remain, rdata[15] );
 			do
 			{
