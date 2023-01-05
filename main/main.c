@@ -120,7 +120,7 @@ void tud_hid_set_report_cb(uint8_t itf,
 						   uint16_t bufsize )
 {
 	// Code 0xad has a special setting in TUD_HID_REPORT_DESC_GAMEPAD to allow unrestricted HIDAPI access from Windows.
-	if( report_id == 0xad && buffer[1] == 0x73 )
+	if( report_id >= 0xaa && report_id <= 0xad && buffer[1] == 0x73 )
 	{
 		// DMX packet
 		int offset = buffer[2] * 4;
